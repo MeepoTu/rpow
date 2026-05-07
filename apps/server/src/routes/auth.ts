@@ -11,13 +11,41 @@ export async function authRoutes(app: FastifyInstance) {
     const parsed = RequestBody.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'BAD_REQUEST', message: 'invalid email' });
     const email = parsed.data.email.toLowerCase().trim();
+    const ip = (req.ip ?? '0.0.0.0');
+
+    const cooldown = await app.pool.query<{ created_at: Date }>(
+      `SELECT created_at FROM magic_links WHERE email=$1 ORDER BY created_at DESC LIMIT 1`,
+      [email],
+    );
+    if (cooldown.rows[0]) {
+      const elapsedMs = Date.now() - cooldown.rows[0].created_at.getTime();
+      if (elapsedMs < 30_000) {
+        return reply.code(429).send({ error: 'RATE_LIMITED', message: 'try again shortly', retry_after: Math.ceil((30_000 - elapsedMs) / 1000) });
+      }
+    }
+
+    const perEmail = await app.pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM magic_links WHERE email=$1 AND created_at > now() - interval '1 hour'`,
+      [email],
+    );
+    if ((perEmail.rows[0]?.n ?? 0) >= 30) {
+      return reply.code(429).send({ error: 'RATE_LIMITED', message: 'too many attempts on this email; try again later', retry_after: 60 * 30 });
+    }
+
+    const perIp = await app.pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM magic_links WHERE ip_addr=$1 AND created_at > now() - interval '1 hour'`,
+      [ip],
+    );
+    if ((perIp.rows[0]?.n ?? 0) >= 60) {
+      return reply.code(429).send({ error: 'RATE_LIMITED', message: 'too many attempts from this network', retry_after: 60 * 30 });
+    }
 
     const { token, hash } = issueMagicLink();
     const id = randomUUID();
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
     await app.pool.query(
-      'INSERT INTO magic_links(id, email, token_hash, expires_at) VALUES($1,$2,$3,$4)',
-      [id, email, hash, expiresAt],
+      'INSERT INTO magic_links(id, email, token_hash, expires_at, ip_addr) VALUES($1,$2,$3,$4,$5)',
+      [id, email, hash, expiresAt, ip],
     );
     const link = `${app.config.magicLinkBaseUrl}/auth/verify?token=${token}`;
     await app.mailer.send({
@@ -26,6 +54,7 @@ export async function authRoutes(app: FastifyInstance) {
       text: `Click to sign in:\n${link}\n\nLink expires in 15 minutes.`,
       html: `<p>Click to sign in to <a href="${link}">rpow2</a>.</p><p><a href="${link}">${link}</a></p><p>Link expires in 15 minutes.</p>`,
     });
+
     return { ok: true, cooldown_seconds: 30 };
   });
 

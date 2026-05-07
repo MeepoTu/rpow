@@ -3,6 +3,7 @@ import { HashRouter, Route, Routes, NavLink } from 'react-router-dom';
 import { applyTheme, loadTheme, nextTheme, type Theme } from './theme.js';
 import { LoginPage } from './pages/Login.js';
 import { WalletPage } from './pages/Wallet.js';
+import { MinePage } from './pages/Mine.js';
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>(loadTheme());
@@ -30,7 +31,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<WalletPage />} />
             <Route path="/login" element={<LoginPage />} />
-            <Route path="/mine" element={<div>(mine placeholder)</div>} />
+            <Route path="/mine" element={<MinePage />} />
             <Route path="/send" element={<div>(send placeholder)</div>} />
             <Route path="/activity" element={<div>(activity placeholder)</div>} />
             <Route path="/ledger" element={<div>(ledger placeholder)</div>} />

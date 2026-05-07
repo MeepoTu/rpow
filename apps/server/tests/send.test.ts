@@ -69,6 +69,19 @@ describe('POST /send', () => {
     expect(res.json().error).toBe('INSUFFICIENT_BALANCE');
   });
 
+  it('rejects same idempotency_key with different parameters', async () => {
+    const ctx = await makeTestApp(); cleanup = ctx.cleanup;
+    const aCookie = await loginAs(ctx, 'a@x.com');
+    await loginAs(ctx, 'b@x.com');
+    await loginAs(ctx, 'c@x.com');
+    await mineN(ctx, aCookie, 2);
+    const key = randomUUID();
+    const first = await ctx.app.inject({ method: 'POST', url: '/send', headers: { cookie: aCookie, 'content-type': 'application/json' }, payload: { recipient_email: 'b@x.com', amount: 1, idempotency_key: key } });
+    expect(first.statusCode).toBe(200);
+    const conflict = await ctx.app.inject({ method: 'POST', url: '/send', headers: { cookie: aCookie, 'content-type': 'application/json' }, payload: { recipient_email: 'c@x.com', amount: 1, idempotency_key: key } });
+    expect(conflict.statusCode).toBe(409);
+  });
+
   it('idempotency: same key returns same result', async () => {
     const ctx = await makeTestApp(); cleanup = ctx.cleanup;
     const aCookie = await loginAs(ctx, 'a@x.com');

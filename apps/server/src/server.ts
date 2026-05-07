@@ -20,6 +20,7 @@ const app = await buildApp({
     signingPrivateKeyHex: env.RPOW_SIGNING_PRIVATE_KEY_HEX,
     signingPublicKeyHex: env.RPOW_SIGNING_PUBLIC_KEY_HEX,
     webOrigin: env.WEB_ORIGIN,
+    secureCookies: env.NODE_ENV === 'production',
   },
 });
 await app.listen({ host: '0.0.0.0', port: env.PORT });

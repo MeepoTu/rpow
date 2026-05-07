@@ -25,11 +25,16 @@ export async function sendRoutes(app: FastifyInstance) {
 
     if (recipient === sender) return reply.code(400).send({ error: 'BAD_REQUEST', message: 'cannot send to self' });
 
-    const out = await withTx(app.pool, async (c) => {
+    let out;
+    try {
+    out = await withTx(app.pool, async (c) => {
       const existing = await c.query<{ id: string; recipient_email: string; amount: number }>(
         'SELECT id, recipient_email, amount FROM transfers WHERE idempotency_key=$1', [idem],
       );
       if (existing.rows[0]) {
+        if (existing.rows[0].recipient_email !== recipient || existing.rows[0].amount !== amount) {
+          return { error: 'BAD_REQUEST' as const, message: 'idempotency_key reused with different parameters', status: 409 };
+        }
         return { ok: true as const, transferred: existing.rows[0].amount, recipient_email: existing.rows[0].recipient_email, transfer_id: existing.rows[0].id };
       }
 
@@ -67,6 +72,17 @@ export async function sendRoutes(app: FastifyInstance) {
       );
       return { ok: true as const, transferred: amount, recipient_email: recipient, transfer_id: transferId };
     });
+    } catch (e: any) {
+      if (e?.code === '23505') {
+        const existing = await app.pool.query<{ id: string; recipient_email: string; amount: number }>(
+          'SELECT id, recipient_email, amount FROM transfers WHERE idempotency_key=$1', [idem],
+        );
+        if (existing.rows[0]) {
+          return reply.send({ ok: true, transferred: existing.rows[0].amount, recipient_email: existing.rows[0].recipient_email, transfer_id: existing.rows[0].id });
+        }
+      }
+      throw e;
+    }
 
     if ('error' in out) return reply.code(out.status).send({ error: out.error, message: out.message });
     return out;

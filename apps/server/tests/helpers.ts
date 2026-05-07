@@ -42,6 +42,7 @@ export async function makeTestApp(): Promise<{
       signingPrivateKeyHex: '11'.repeat(32),
       signingPublicKeyHex: '22'.repeat(32),
       webOrigin: 'http://web.test',
+      secureCookies: false,
     },
   });
   return {

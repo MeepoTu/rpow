@@ -19,6 +19,7 @@ export interface AppConfig {
   signingPrivateKeyHex: string;
   signingPublicKeyHex: string;
   webOrigin: string;
+  secureCookies: boolean;
 }
 
 export interface BuildAppOptions {

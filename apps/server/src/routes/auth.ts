@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { issueMagicLink, verifyMagicLink } from '../magic.js';
+import { hashToken, issueMagicLink } from '../magic.js';
 import { signSession, SESSION_COOKIE, SESSION_TTL_SECONDS, verifySession } from '../session.js';
 
 const RequestBody = z.object({ email: z.string().email() });
@@ -62,10 +62,12 @@ export async function authRoutes(app: FastifyInstance) {
     const token = (req.query as Record<string, string>).token;
     if (!token) return reply.code(400).send({ error: 'BAD_REQUEST', message: 'missing token' });
 
+    const tokenHash = hashToken(token);
     const { rows } = await app.pool.query(
-      'SELECT id, email, token_hash, expires_at, used_at FROM magic_links WHERE expires_at > now() AND used_at IS NULL',
+      'SELECT id, email, expires_at, used_at FROM magic_links WHERE token_hash=$1 AND expires_at > now() AND used_at IS NULL',
+      [tokenHash],
     );
-    const match = rows.find(r => verifyMagicLink(token, r.token_hash));
+    const match = rows[0];
     if (!match) return reply.code(400).send({ error: 'BAD_REQUEST', message: 'invalid or expired link' });
 
     await app.pool.query('UPDATE magic_links SET used_at=now() WHERE id=$1', [match.id]);
@@ -78,7 +80,7 @@ export async function authRoutes(app: FastifyInstance) {
 
     const sessionToken = signSession({ email: match.email }, app.config.sessionSecret, SESSION_TTL_SECONDS);
     reply.setCookie(SESSION_COOKIE, sessionToken, {
-      httpOnly: true, secure: !req.headers.host?.startsWith('localhost'),
+      httpOnly: true, secure: app.config.secureCookies,
       sameSite: 'lax', path: '/', maxAge: SESSION_TTL_SECONDS,
     });
     return reply.redirect(`${app.config.webOrigin}/#/wallet`, 302);

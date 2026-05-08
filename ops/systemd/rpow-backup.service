@@ -1,0 +1,11 @@
+[Unit]
+Description=rpow nightly backup
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rpow-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

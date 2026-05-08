@@ -40,7 +40,8 @@ Move the rpow API (currently `api.rpow2.com` on Fly.io, iad) and its Postgres da
 | Reverse proxy | nginx | Handles TLS, gzip, static error pages; well-trodden |
 | TLS | Let's Encrypt via certbot | Free, auto-renewing |
 | Backups | restic → Backblaze B2 | Cheap (~$6/TB/mo), encrypted, S3-compatible |
-| Cutover | Logical replication if Neon Free supports it; else dump/restore at low-traffic hour | Both feasible; logical-repl preferred for ~zero downtime |
+| Cutover | Single path: pg_dump/pg_restore at low-traffic hour | DB is only 294 MB → dump+restore is ~60–90s of write-paused time. Far simpler than logical replication; sequences carry over automatically; eliminates Neon-tier dependency |
+| DNS / TLS | Cloudflare DNS (already migrated); LE cert via DNS-01 with Cloudflare API token | Auto-renewing certs forever; scriptable cutover; api.rpow2.com is **DNS-only** (proxy off), apex stays proxied |
 | Process supervisor | systemd | Native, no extra dep |
 | Secrets | `/etc/rpow/server.env`, mode 0640, root:rpow | Standard pattern, readable only by app user |
 | Postgres bind | localhost / Unix socket only | No external port; eliminates an attack surface |
@@ -165,48 +166,74 @@ Required (per `apps/server/src/env.ts`):
 
 Capture via `flyctl ssh console --app rpow2-server` then `env | grep ...`, or `flyctl secrets list` + the original generation site for any opaque ones. **Never commit these to git.**
 
-## Database migration
+## Database migration — pg_dump / pg_restore
 
-### Path A — logical replication (preferred)
+Single-path cutover. DB size is 294 MB → dump+restore in ~60–90s. Logical-replication complexity (Neon-tier dependency, sequences gotcha, more moving parts) buys nothing meaningful at this size.
 
-Pre-flight: against Neon, run `SHOW wal_level;`. If `logical`, proceed.
+### Pre-cutover (T-24h to T-1h)
 
-1. On VPS, `pg_dump --schema-only --no-owner --no-privileges` from Neon, restore into local `rpow` DB.
-2. On Neon: `CREATE PUBLICATION rpow_pub FOR ALL TABLES;`
-3. On VPS: `CREATE SUBSCRIPTION rpow_sub CONNECTION '<neon-url>' PUBLICATION rpow_pub;`
-4. Wait for `pg_stat_subscription` to show `received_lsn ≈ pg_current_wal_lsn` on Neon (lag < 1s).
-5. Pre-cutover (T-24h): drop `api.rpow2.com` DNS TTL to 60s.
-6. Cutover (~30s):
-   1. Stop the Fly app: `flyctl scale count 0 --app rpow2-server`. With no app, no writes can hit Neon.
-   2. Verify replication caught up to last LSN.
-   3. **Bump sequences on VPS** to match Neon — logical replication does NOT replicate sequence values. Iterate every sequence with `SELECT setval('seq_name', (SELECT MAX(id) FROM table_name));`.
-   4. `DROP SUBSCRIPTION rpow_sub;` (disables replication; VPS DB is now authoritative).
-   5. Start the rpow service on the VPS: `systemctl start rpow-server`.
-   6. Smoke test: `curl https://<vps-ip>/health` (with Host header), then with DNS still pointing at Fly's last IP, hit the VPS by IP via `--resolve`.
-   7. Flip DNS A record `api.rpow2.com` → `15.204.254.192`. With 60s TTL, traffic transitions over ~1–2 min.
-7. Verification: hit `/health`, manually mint + transfer + check `/ledger`. Watch `journalctl -u rpow-server -f` and Postgres logs for ~30 min.
-8. After 48h soak, decommission Fly: `flyctl apps destroy rpow2-server`.
+- VPS fully built: hardening done, Postgres + nginx + rpow-server installed, env vars in `/etc/rpow/server.env`.
+- LE cert for `api.rpow2.com` already issued via DNS-01 + Cloudflare API token (works because the cert request only needs a TXT record, not actual A-record routing).
+- Local Postgres has the schema applied (from `apps/server/migrations/`) and is empty.
+- rpow-server running on VPS, smoke-tested via `curl --resolve api.rpow2.com:443:<vps-ip> ...` against an empty DB.
+- Cloudflare A-record TTL for `api.rpow2.com` lowered to 60s (already DNS-only after this design).
+- Pre-cutover **safety dump**: `pg_dump -Fc <neon> > /opt/rpow/safety-dump-<utc>.dump` archived to B2 immediately. This is the rollback artifact if anything goes sideways.
 
-**Gotcha — sequences:** the most common silent failure mode for logical replication. The mitigation is step 6.iii above, run as a one-shot SQL script generated from `pg_class` lookup. Spec the script before cutover; do not improvise.
+### Cutover sequence (target ~120s user-visible interruption)
 
-**Gotcha — `pg_publication_tables` schema drift:** if Neon and VPS Postgres versions diverge, a column mismatch can surface during initial copy. Mitigation: pin VPS to PG 16 (Neon's current default).
+```
+T+0s    flyctl scale count 0 --app rpow2-server
+        → Fly app fully stopped. No writes can reach Neon.
 
-### Path B — dump/restore at low-traffic hour (fallback)
+T+10s   Verify quiescence on Neon:
+          SELECT pid, usename, state, query
+          FROM pg_stat_activity
+          WHERE datname = current_database() AND state = 'active';
+        → expect zero rows other than our own session.
 
-If Neon Free tier blocks logical replication (or it misbehaves):
+T+20s   pg_dump -Fc -d <neon-url> -f /tmp/rpow-cutover.dump
+        → ~10s.
 
-1. All hardening + app setup done as in Path A.
-2. Schedule cutover for low-traffic window (pick from server logs).
-3. Sequence:
-   1. `flyctl scale count 0 --app rpow2-server` — site goes 503.
-   2. `pg_dump -Fc <neon-url> > rpow.dump` (expect <1 min for current data size).
-   3. `pg_restore -d rpow rpow.dump` on VPS (sequences come along automatically here).
-   4. Start `rpow-server` on VPS.
-   5. Smoke test by IP.
-   6. Flip DNS A record.
-4. Expected user-visible outage: ~5–10 min.
+T+40s   pg_restore -d rpow --clean --if-exists /tmp/rpow-cutover.dump
+        → ~30s. Sequences restored automatically.
 
-Prepare both paths; decide which to run after the pre-flight `SHOW wal_level` check.
+T+90s   VERIFICATION GATE — row-count parity:
+          run pre-prepared SQL on both Neon and VPS, comparing
+          count(*) for every table. Any mismatch → ABORT (see rollback).
+
+T+95s   systemctl start rpow-server  (VPS app now live, but no DNS yet)
+
+T+100s  Smoke test via --resolve:
+          /health
+          full e2e: magic-link → mint → transfer → ledger
+          token-verify against a pre-cutover token (proves signing key carried correctly)
+
+T+120s  VERIFICATION GATE — all smoke tests pass?
+        Any failure → ABORT (rollback below).
+
+T+125s  Cloudflare API: PATCH api.rpow2.com A-record → VPS IP.
+        With 60s TTL + DNS-only (no proxy cache), resolvers catch up in ~30–60s.
+
+T+200s  Monitor /health, journalctl, nginx logs, postgres logs for ~30 min.
+```
+
+### Rollback (each verification gate is a fork)
+
+- **Before T+125s (DNS flip):** simply `flyctl scale count 1 --app rpow2-server`. Neon was untouched (our session was read-only). Site resumes on Fly. The dump is discarded, the cause investigated, retry later. **Zero data loss; ~2 min outage.**
+- **After T+125s, within 5 min:** revert the Cloudflare A-record back to Fly's IP, then `flyctl scale count 1`. Any writes that hit the VPS in the gap are stranded; recover from VPS DB by `pg_dump`-ing the affected rows and replaying onto Neon. Document the recovery script in the runbook in advance.
+- **After T+125s, beyond 5 min:** treat the VPS as authoritative; troubleshoot in place. Never roll back to Neon at this point (it has stale data).
+
+### Defense in depth
+
+1. Pre-cutover safety dump uploaded to B2 before T+0.
+2. Two human-in-the-loop verification gates with explicit pass/fail criteria.
+3. Pre-prepared row-count parity SQL (committed to repo before cutover day).
+4. Pre-prepared smoke-test script (committed to repo before cutover day).
+5. Neon project kept alive for 7 days post-cutover as a frozen reference (don't delete the project until soak passes).
+
+### Pre-cutover token-verify check
+
+To prove the signing key carried correctly: take one existing token from Neon (any `token_id` from the `tokens` table), keep its hex/JSON aside. After T+95s on the VPS, hit `POST /verify` (or whatever the verification endpoint is — confirm during impl) with that token. If it verifies, the Ed25519 private key was carried correctly. If it doesn't, **do not flip DNS** — the signing key is wrong and all post-flip user activity will produce tokens incompatible with pre-flip ones.
 
 ## Backups (B2)
 
@@ -253,13 +280,14 @@ Migrations: the existing `apps/server/migrations/` directory holds the SQL. The 
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Sequences out-of-sync after logical-repl cutover | Med | High (PK collisions) | Explicit `setval` script in cutover step |
-| Neon Free blocks logical replication | Med | Low | Path B fallback ready; cutover at low-traffic hour |
-| Lost signing key on Fly secrets | Low | Catastrophic (all tokens void) | Capture key BEFORE touching Fly; verify on VPS before flip |
-| VPS disk fills (Postgres + WAL + logs) | Med | High | Disk monitor in `rpow-status`; logrotate; restic prune |
-| Single-host failure | Low | Total outage | Backups + documented restore; HA out of scope for v1 |
-| Let's Encrypt rate limit during testing | Low | Stuck without TLS | Use `--staging` for first cert; switch to prod once nginx is happy |
-| Forgot to update `MAGIC_LINK_BASE_URL` | Low | Magic-link emails point at wrong host | Already in env carry-over checklist |
+| Lost signing key on Fly secrets | Low | Catastrophic (all tokens void) | Capture from Fly secrets BEFORE touching Fly; verify on VPS via pre-cutover token-verify check; explicit gate before DNS flip |
+| Row-count mismatch after restore | Low | High (silent data loss) | Pre-prepared parity SQL run as gate at T+90s; abort if any mismatch |
+| VPS disk fills (Postgres + WAL + logs) | Med | High | Disk monitor in `rpow-status`; logrotate; restic prune; alert at 80% |
+| Single-host failure | Low | Total outage | Backups + documented restore drill; HA out of scope for v1 |
+| Let's Encrypt rate limit during testing | Low | Stuck without TLS | Use `--staging` for first cert; switch to prod once issuance flow works |
+| Forgot to carry an env var | Low | Various breakage | Explicit env-var checklist; `rpow-server` fails fast on missing required vars (already in `env.ts`) |
+| DNS resolver caches old A-record beyond TTL | Med | Some users see 503 for 5-10 min | TTL = 60s well in advance; Fly's old IP returns connection refused (not stale data); affected users retry |
+| Neon read at `pg_dump` time fails | Low | Cutover aborts at T+20s | Safety dump from T-1h is still a fallback; restart Fly and retry |
 
 ## Success criteria
 
@@ -270,8 +298,14 @@ Migrations: the existing `apps/server/migrations/` directory holds the SQL. The 
 - Nightly backup runs and restic verifies. Test restore succeeds into a scratch DB.
 - Fly app destroyed, no surprise charges next month.
 
-## Open questions for impl plan
+## Resolved (post-design)
 
-- Exact data size on Neon (informs whether Path A is overkill).
-- Are there scheduled Fly cron jobs / machines beyond the one app? (Spec assumes single app machine.)
-- Do we want a staging hostname (`api-staging.rpow2.com`) on the VPS for the smoke-test step, or is `--resolve` to the IP sufficient?
+- **Data size on Neon:** ~294 MB (project `rpow2`, AWS us-east-1). Small enough that `pg_dump` over the wire is ~10s.
+- **Fly cron / extra machines:** none. Single app machine; cutover doesn't coordinate with anything else.
+- **Cutover path:** committed to **dump/restore** (single path). Logical replication dropped from the plan — the complexity isn't justified at 294 MB.
+- **Staging hostname:** none. Smoke-test via `curl --resolve api.rpow2.com:443:<vps-ip> https://api.rpow2.com/...`.
+- **DNS:** already on Cloudflare. Registrar (GoDaddy) NS = mira/trey.ns.cloudflare.com; zone status active; propagation in progress (Google's resolver already updated). All email records (DMARC, DKIM, SPF, MX) imported correctly.
+- **Cloudflare proxy mode:** `api.rpow2.com` is **DNS-only** (proxy off, both A and AAAA — flipped via API on 2026-05-07). Apex `rpow2.com` and `www.rpow2.com` stay proxied — they're for the Netlify-hosted SPA which benefits from edge caching.
+- **Cloudflare API token:** scoped to `rpow2.com` zone, perms `Zone:Read + Zone:DNS:Edit`, never expires. Stored locally in `rpow/.env` as `CLOUDFLARE_API_TOKEN`. Will live on the VPS at `/etc/letsencrypt/cloudflare.ini` (mode 0600) for cert renewals.
+- **TLS issuance:** DNS-01 challenge via certbot-dns-cloudflare. Cert provisioned **before** any DNS flip (DNS-01 only needs a TXT record, not the A-record we're cutting over). Auto-renewal via cron/systemd-timer thereafter.
+- **Cloudflare zone ID:** `685720286628e21c9b43f260ac6b63bf` (cached for cutover script).

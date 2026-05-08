@@ -1,16 +1,31 @@
 import type { FastifyInstance } from 'fastify';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { readSession } from './auth.js';
+import { difficultyForSupply } from '../schedule.js';
 
 export async function challengeRoutes(app: FastifyInstance) {
   app.post('/challenge', async (req, reply) => {
     const s = readSession(req as any, app.config.sessionSecret);
     if (!s) return reply.code(401).send({ error: 'UNAUTHORIZED', message: 'login required' });
 
+    const { rows } = await app.pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM tokens WHERE parent_token_id IS NULL`,
+    );
+    const minted = rows[0]!.n;
+    if (minted >= app.config.mintMaxSupply) {
+      return reply.code(410).send({ error: 'SUPPLY_EXHAUSTED', message: '21M cap reached' });
+    }
+
+    const scheduledBits = difficultyForSupply(minted, {
+      baseBits: app.config.difficultyBits,
+      epochSize: app.config.mintEpochSize,
+      maxSupply: app.config.mintMaxSupply,
+    });
+    const difficulty = Math.max(app.config.difficultyFloor, scheduledBits);
+
     const id = randomUUID();
     const noncePrefix = randomBytes(16);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
-    const difficulty = Math.max(app.config.difficultyFloor, app.config.difficultyBits);
     await app.pool.query(
       'INSERT INTO challenges(id, user_email, nonce_prefix, difficulty_bits, expires_at) VALUES($1,$2,$3,$4,$5)',
       [id, s.email, noncePrefix, difficulty, expiresAt],

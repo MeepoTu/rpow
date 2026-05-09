@@ -70,8 +70,8 @@ struct MineArgs {
 struct SendArgs {
     #[arg(long)]
     to: String,
-    #[arg(long)]
-    amount: i64,
+    #[arg(long, help = "Amount in RPOW; supports up to 9 decimal places")]
+    amount: String,
 }
 
 fn main() {
@@ -143,7 +143,7 @@ fn cookie_login(base_url: &str, args: CookieLoginArgs) -> Result<()> {
         base_url: client.base_url().to_string(),
         session_cookie,
     })?;
-    println!("cookie login complete for {}", me.email);
+    println!("cookie login complete for {}", me.email());
     Ok(())
 }
 
@@ -160,11 +160,20 @@ fn logout() -> Result<()> {
 fn me(base_url: &str) -> Result<()> {
     let client = session_client(base_url)?;
     let me = client.me()?;
-    println!("LOGGED IN AS : {}", me.email);
-    println!("BALANCE      : {}", me.balance);
-    println!("MINTED       : {}", me.minted);
-    println!("SENT         : {}", me.sent);
-    println!("RECEIVED     : {}", me.received);
+    println!("LOGGED IN AS : {}", me.email());
+    println!("BALANCE      : {}", me.balance_display());
+    println!("MINTED       : {}", me.minted_display());
+    println!("SENT         : {}", me.sent_display());
+    println!("RECEIVED     : {}", me.received_display());
+    if let Some(wrap_allowed) = me.wrap_allowed() {
+        println!("WRAP ALLOWED : {}", if wrap_allowed { "yes" } else { "no" });
+    }
+    if let Some(wallet) = me.solana_wallet() {
+        println!("SOLANA WALLET: {}", wallet);
+    }
+    if let Some(wrapped) = me.wrapped_supply_display() {
+        println!("WRAPPED      : {}", wrapped);
+    }
     Ok(())
 }
 
@@ -236,9 +245,9 @@ fn mine(base_url: &str, args: MineArgs) -> Result<()> {
         let rate_mhs = (hashes as f64 / elapsed.as_secs_f64().max(0.001)) / 1_000_000.0;
         println!(
             "minted token {} value={} issued_at={} hashes={} elapsed={:.2}s rate={:.2} MH/s",
-            response.token.id,
-            response.token.value,
-            response.token.issued_at,
+            response.token.id(),
+            response.token.value_display(),
+            response.token.issued_at(),
             hashes,
             elapsed.as_secs_f64(),
             rate_mhs
@@ -261,23 +270,27 @@ fn mine(base_url: &str, args: MineArgs) -> Result<()> {
 
 fn send(base_url: &str, args: SendArgs) -> Result<()> {
     let client = session_client(base_url)?;
-    let response = client.send(&SendRequestBody {
-        recipient_email: args.to,
-        amount: args.amount,
-        idempotency_key: Uuid::new_v4().to_string(),
-    })?;
-    if !response.ok {
+    let response = client.send(&SendRequestBody::from_rpow_amount(
+        args.to,
+        &args.amount,
+        Uuid::new_v4().to_string(),
+    )?)?;
+    if !response.ok() {
         anyhow::bail!("server reported send failure");
     }
-    if response.pending.unwrap_or(false) {
+    if response.pending() {
         println!(
             "pending claim: {} RPOW reserved for {} (transfer id {})",
-            response.transferred, response.recipient_email, response.transfer_id
+            response.transferred_display(),
+            response.recipient_email(),
+            response.transfer_id()
         );
     } else {
         println!(
             "sent {} RPOW to {} (transfer id {})",
-            response.transferred, response.recipient_email, response.transfer_id
+            response.transferred_display(),
+            response.recipient_email(),
+            response.transfer_id()
         );
     }
     Ok(())
@@ -291,15 +304,16 @@ fn activity(base_url: &str) -> Result<()> {
         return Ok(());
     }
     for item in items {
+        let type_name = item.type_name();
         println!(
             "{}  {:<8}  {:>4}  {}",
-            item.at.replace('T', " ").chars().take(19).collect::<String>(),
-            item.r#type.to_uppercase(),
-            match item.r#type.as_str() {
-                "send" => format!("-{}", item.amount),
-                _ => format!("+{}", item.amount),
+            item.at().replace('T', " ").chars().take(19).collect::<String>(),
+            type_name.to_uppercase(),
+            match type_name {
+                "send" => format!("-{}", item.amount_display()),
+                _ => format!("+{}", item.amount_display()),
             },
-            item.counterparty_email.unwrap_or_default()
+            item.counterparty_email().unwrap_or_default()
         );
     }
     Ok(())
@@ -308,11 +322,38 @@ fn activity(base_url: &str) -> Result<()> {
 fn ledger(base_url: &str) -> Result<()> {
     let client = ApiClient::new(base_url.to_string(), None)?;
     let ledger = client.ledger()?;
-    println!("TOTAL MINTED       : {}", ledger.total_minted);
-    println!("TOTAL TRANSFERRED  : {}", ledger.total_transferred);
-    println!("CIRCULATING SUPPLY : {}", ledger.circulating_supply);
-    println!("CURRENT DIFFICULTY : {} trailing zero bits", ledger.current_difficulty_bits);
-    println!("USER COUNT         : {}", ledger.user_count);
+    println!("TOTAL MINTED       : {}", ledger.total_minted_display());
+    println!("TOTAL TRANSFERRED  : {}", ledger.total_transferred_display());
+    println!("CIRCULATING SUPPLY : {}", ledger.circulating_supply_display());
+    if let Some(counter) = ledger.minted_counter_display() {
+        println!("MINT COUNTER       : {}", counter);
+    }
+    if let Some(max_supply) = ledger.max_supply_display() {
+        println!("MAX SUPPLY         : {}", max_supply);
+    }
+    println!(
+        "CURRENT DIFFICULTY : {} trailing zero bits",
+        ledger.current_difficulty_bits()
+    );
+    if let Some(reward) = ledger.current_reward_display() {
+        println!("CURRENT REWARD     : {}", reward);
+    }
+    if let Some(reward) = ledger.next_reward_display() {
+        println!("NEXT REWARD        : {}", reward);
+    }
+    if let Some(next_halving) = ledger.next_halving_at_display() {
+        println!("NEXT HALVING AT    : {}", next_halving);
+    }
+    if let Some(remaining) = ledger.units_to_next_halving_display() {
+        println!("TO NEXT HALVING    : {}", remaining);
+    }
+    if let Some(halving_index) = ledger.halving_index() {
+        println!("HALVING INDEX      : {}", halving_index);
+    }
+    if let Some(is_capped) = ledger.is_capped() {
+        println!("SUPPLY CAPPED      : {}", if is_capped { "yes" } else { "no" });
+    }
+    println!("USER COUNT         : {}", ledger.user_count());
     Ok(())
 }
 

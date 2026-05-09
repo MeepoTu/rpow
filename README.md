@@ -83,6 +83,13 @@ Show help:
 cargo run -p rpow-cli --bin rpow -- --help
 ```
 
+Build the debug CLI binary:
+
+```bash
+cargo build -p rpow-cli
+./target/debug/rpow --help
+```
+
 ### Configure server URL
 
 By default the CLI uses:
@@ -208,6 +215,15 @@ Send tokens:
 ./target/release/rpow --base-url https://api.rpow2.com send --to other@example.com --amount 3
 ```
 
+`send --amount` is interpreted in `RPOW`, not base units. The CLI accepts up to 9 decimal places and converts to the server's `amount_base_units` protocol automatically:
+
+```bash
+./target/release/rpow --base-url https://api.rpow2.com send --to other@example.com --amount 1.25
+./target/release/rpow --base-url https://api.rpow2.com send --to other@example.com --amount 0.000000001
+```
+
+When talking to older servers, the CLI also sends the legacy integer `amount` field when the requested value is an exact whole-number RPOW amount.
+
 Logout:
 
 ```bash
@@ -249,6 +265,31 @@ npm --workspace @rpow/server run dev
 
 # In another terminal
 npm --workspace @rpow/web run dev
+```
+
+To test the CLI locally against the dev server without sending real email, use `RPOW_TEST_INBOX=true` and fetch the last magic link from the test endpoint:
+
+```bash
+# In another terminal
+cargo build -p rpow-cli
+./target/debug/rpow login --email a@x.com
+
+# In a third terminal, fetch the test magic link and paste the returned link
+# back into the CLI prompt above.
+curl 'http://localhost:8080/test/last-link/a@x.com?json=1'
+
+# After login
+./target/debug/rpow me
+./target/debug/rpow mine --once --cores 1
+./target/debug/rpow send --to b@x.com --amount 1
+./target/debug/rpow ledger
+```
+
+If you want to test sending to another local account, log the recipient in once first so the account exists:
+
+```bash
+./target/debug/rpow login --email b@x.com
+curl 'http://localhost:8080/test/last-link/b@x.com?json=1'
 ```
 
 ## Deploy
